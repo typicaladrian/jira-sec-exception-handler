@@ -60,17 +60,81 @@ def fetch_unprocessed_tickets(jira_client, project_key):
         logging.error(f"An unexpected error occurred: {e}")
         return []
     
+# Validate tickets = checking for missing details/incomplete forms
+def validate_ticket(issue):
+    missing_fields = []
+
+    description = issue.fields.description or ""
+
+    # Check for any missing required fields in ticket, append to list of missing fields
+    if "Business Justification:" not in description:
+        missing_fields.append("Business Justification")
+
+    if "Technical Parameters:" not in description:
+        missing_fields.append("Technical Parameters (e.g., IP addresses, domains)")
+
+    # return list of missing fields
+    return missing_fields
+
+# Append comment and tag author of incomplete ticket and transition ticket status
+def notify_author_and_transition(jira_client, issue, missing_fields):
+    transition_id = os.getenv('TRANSITION_ID_IN_PROGRESS')
+    ticket_author_id = issue.fields.reporter.accountId if issue.fields.reporter else ""
+    
+    # Constructing comment using Jira's tagging format
+    comment_body = (
+        f"Hello [~accountid:{ticket_author_id}],\n\n"
+        f"Your security exception request has been marked as incomplete. "
+        f"To proceed, we require the following missing information:\n"
+    )
+
+    # Add missing fields to comment body
+    for field in missing_fields:
+        comment_body += f"- **{field}**\n"
+
+    comment_body += "\nPlease update this ticket at your earliest convenience :)"
+
+    # Post comment to the ticket and transition ticket state to "In Progress".
+    # In an enterprise setting, ticket state would be transitioned to a...
+    #   ... custom ticket state, (e.g "Pending Information", "Pending LOB Response")... 
+    #   ... ticket state.
+    try:
+        jira_client.add_comment(issue.key, comment_body)
+        logging.info(f"Added LOB pushback comment to {issue.key}")
+
+        if transition_id:
+            jira_client.transition_issue(issue, transition_id)
+            logging.info(f"Transition {issue.key} to pending state.")
+        else:
+            logging.warning("No transition ID found in .env. Skipping ticket status update.")
+
+    except JIRAError as e:
+        logging.error(f"Failed to process updates for {issue.key}. Reason: {e.text}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        return []
 
 if __name__ == "__main__":
     load_dotenv()
     project_key = os.getenv('JIRA_PROJECT_KEY')
 
-    # 1. Authenticate to Jira
+    # Step 1. Authenticate to Jira
     jira_client = authenticate_jira()
 
-    # 2. Fetch tickets
+    # Step 2. Fetch tickets
     unprocessed_issues = fetch_unprocessed_tickets(jira_client, project_key)
 
-    # quick testing of fetching with dummy tickets
+    # Step 3. Validate each fetched ticket against our required fields
     for issue in unprocessed_issues:
-        print(f"Found Ticket: {issue.key} - {issue.fields.summary}")
+        logging.info(f"Processing Ticket: {issue.key} - {issue.fields.summary}")
+
+        missing_data = validate_ticket(issue)
+
+        # Issue warning and comment to author if ticket is found to be missing data; else, inform of successful verification
+        if missing_data:
+            logging.warning(f"Ticket {issue.key} is INCOMPLETE. Missing: {missing_data}")
+            
+            # Here is where the notification to author and transition of ticket occurs
+            notify_author_and_transition(jira_client, issue, missing_data)
+        else:
+            logging.info(f"Ticket {issue.key} has all required info. Ready for manual review.")
