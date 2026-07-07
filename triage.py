@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from jira import JIRA
 from jira.exceptions import JIRAError
 import ollama
+import json
 
 # Configure detailed logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -76,40 +77,54 @@ def validate_ticket(issue):
     
     payload = f"Title: {summary}\nDescription: {description}"
     
+    # Strict boolean prompt engineering due to smaller, more verbose local llm.
     prompt = (
-        "You are an expert GRC Compliance Auditor for a financial institution. "
-        "Review the following Jira ticket description submitted by a Line of Business. "
-        "Does the text clearly explain WHY they need this exception (Business Justification) "
-        "AND WHAT specific systems are involved (Technical Parameters like IPs, domains, or server names)? "
-        "Respond ONLY with 'PASS' if both are present. "
-        "If it is missing information, respond ONLY with the exact name of what is missing: "
-        "'Business Justification', 'Technical Parameters', or 'Business Justification and Technical Parameters'."
+        "You are a strict GRC Compliance Auditor evaluating a Jira ticket. "
+        "Analyze the ticket and output a JSON object with exactly two boolean keys: "
+        "'has_business_justification' and 'has_technical_parameters'. "
+        "CRITICAL RULES: "
+        "1. has_business_justification: Set to true ONLY if the text explicitly explains the operational WHY (e.g., 'to process reports', 'for client testing'). Set to FALSE if it simply asks for an exception or access (e.g., 'Exception request to X', 'I need access') without giving a reason. "
+        "2. has_technical_parameters: Set to true if the text mentions specific domains, URLs, or IP addresses (e.g., 'api.stripe.com', 'google.com'). "
+        "Respond ONLY with valid JSON. "
     )
 
     try:
-        logging.info(f"Sending ticket {issue.key} payload to local LLM for analysis...")
-        response = ollama.chat(model='phi3', messages=[
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': f"Ticket Description:\n{payload}"}
-        ])
+        logging.info(f"Sending ticket {issue.key} payload to local LLM for Boolean JSON analysis...")
+        
+        response = ollama.chat(
+            model='phi3', 
+            messages=[
+                {'role': 'system', 'content': prompt},
+                {'role': 'user', 'content': f"Ticket Payload:\n{payload}"}
+            ], 
+            format='json',
+            options={'temperature': 0.0} 
+        )
 
         ai_evaluation = response['message']['content'].strip()
-        logging.info(f"LLM evaluation for {issue.key}: {ai_evaluation}")
+        logging.info(f"Raw LLM JSON for {issue.key}: {ai_evaluation}")
 
-        if "PASS" in ai_evaluation.upper():
-            return []
-        elif "AND" in ai_evaluation.upper():
-            return ["Business Justification", "Technical Parameters"]
-        elif "BUSINESS" in ai_evaluation.upper():
-            return ["Business Justification"]
-        elif "TECHNICAL" in ai_evaluation.upper():
-            return ["Technical Parameters (e.g., IP addresses, domains)"]
-        else:
-            logging.warning(f"Unexpected LLM output: {ai_evaluation}. Defaulting to manual review.")
-            return []
-    
+        # Parse the JSON string into a Python dictionary
+        result = json.loads(ai_evaluation)
+        
+        # Extract the booleans (defaulting to False if the AI messes up)
+        has_biz = result.get('has_business_justification', False)
+        has_tech = result.get('has_technical_parameters', False)
+        
+        # Route the logic based on the true/false values
+        missing_data = []
+        if not has_biz:
+            missing_data.append("Business Justification")
+        if not has_tech:
+            missing_data.append("Technical Parameters (e.g., IP addresses, domains)")
+            
+        return missing_data
+        
+    except json.JSONDecodeError:
+        logging.error(f"LLM failed to output valid JSON for {issue.key}. Output was: {ai_evaluation}")
+        return []
     except Exception as e:
-        logging.error(f"Failed to communicate with local LLM. Is LLM running? Error: {e}")
+        logging.error(f"Failed to communicate with local LLM. Error: {e}")
         return []
 
 # Append comment and tag author of incomplete ticket and transition ticket status
