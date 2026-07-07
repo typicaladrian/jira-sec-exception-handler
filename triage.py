@@ -3,6 +3,7 @@ import logging
 from dotenv import load_dotenv
 from jira import JIRA
 from jira.exceptions import JIRAError
+import ollama
 
 # Configure detailed logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,6 +23,8 @@ def authenticate_jira():
         # Attempt to authenticate with Atlassian server
         jira = JIRA(options=jira_options, basic_auth=(email, api_token))
 
+        jira.myself() # quick api call to test current token
+        
         logging.info(f"Successfully authenticated to Jira at {server}")
         
         # Return our successfully connected to Jira client object
@@ -36,7 +39,7 @@ def authenticate_jira():
         exit(1)
 
 # Fetch new, unassigned tickets using JQL
-# JQL (Jira Query Language) is Atlassian's version of SQL, allows us to query tickets server-side
+# JQL (Jira Query Language) is Atlassians's version of SQL, allows us to query tickets server-side
 def fetch_unprocessed_tickets(jira_client, project_key):
     # Construct our target JQL search query
     jql_query = f'project = {project_key} AND status = "To Do" ORDER BY created DESC'
@@ -62,19 +65,52 @@ def fetch_unprocessed_tickets(jira_client, project_key):
     
 # Validate tickets = checking for missing details/incomplete forms
 def validate_ticket(issue):
-    missing_fields = []
-
+    # Using a local LLM, for security and compliance, we evaluate the ticket payload.
+    # Local LLM = Zero data leakage as processing happens entirely on localhost.
+    summary = issue.fields.summary or ""
     description = issue.fields.description or ""
 
-    # Check for any missing required fields in ticket, append to list of missing fields
-    if "Business Justification:" not in description:
-        missing_fields.append("Business Justification")
+    # Prevent using processing power on empty tickets
+    if not summary.strip() and not description.strip():
+        return ["Business Justification", "Technical Parameters"]
+    
+    payload = f"Title: {summary}\nDescription: {description}"
+    
+    prompt = (
+        "You are an expert GRC Compliance Auditor for a financial institution. "
+        "Review the following Jira ticket description submitted by a Line of Business. "
+        "Does the text clearly explain WHY they need this exception (Business Justification) "
+        "AND WHAT specific systems are involved (Technical Parameters like IPs, domains, or server names)? "
+        "Respond ONLY with 'PASS' if both are present. "
+        "If it is missing information, respond ONLY with the exact name of what is missing: "
+        "'Business Justification', 'Technical Parameters', or 'Business Justification and Technical Parameters'."
+    )
 
-    if "Technical Parameters:" not in description:
-        missing_fields.append("Technical Parameters (e.g., IP addresses, domains)")
+    try:
+        logging.info(f"Sending ticket {issue.key} payload to local LLM for analysis...")
+        response = ollama.chat(model='phi3', messages=[
+            {'role': 'system', 'content': prompt},
+            {'role': 'user', 'content': f"Ticket Description:\n{payload}"}
+        ])
 
-    # return list of missing fields
-    return missing_fields
+        ai_evaluation = response['message']['content'].strip()
+        logging.info(f"LLM evaluation for {issue.key}: {ai_evaluation}")
+
+        if "PASS" in ai_evaluation.upper():
+            return []
+        elif "AND" in ai_evaluation.upper():
+            return ["Business Justification", "Technical Parameters"]
+        elif "BUSINESS" in ai_evaluation.upper():
+            return ["Business Justification"]
+        elif "TECHNICAL" in ai_evaluation.upper():
+            return ["Technical Parameters (e.g., IP addresses, domains)"]
+        else:
+            logging.warning(f"Unexpected LLM output: {ai_evaluation}. Defaulting to manual review.")
+            return []
+    
+    except Exception as e:
+        logging.error(f"Failed to communicate with local LLM. Is LLM running? Error: {e}")
+        return []
 
 # Append comment and tag author of incomplete ticket and transition ticket status
 def notify_author_and_transition(jira_client, issue, missing_fields):
